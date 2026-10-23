@@ -1,8 +1,8 @@
 # Gene2GWAS-eQTL | Streamlit Community Cloud
 
-A Streamlit browser app that queries human gene-associated GWAS Catalog v2 records and GTEx v2 significant cis-eQTL results, displays tables and plots, matches shared rsIDs, and exports an Excel workbook.
+A Streamlit browser app that queries human gene-associated GWAS Catalog v2 records and GTEx v2 significant cis-eQTL results, displays tables and plots, matches shared chromosome-position coordinates (GRCh38/hg38), and exports an Excel workbook.
 
-> For academic exploratory use. A GWAS mapped gene is not a causal-gene assignment; matching rsIDs is **not** formal GWAS–eQTL colocalization. Not finding records is not evidence of no association.
+> For academic exploratory use. A GWAS mapped gene is not a causal-gene assignment; chromosome-position overlap is **not** formal GWAS–eQTL colocalization and does not guarantee allele concordance. Not finding records is not evidence of no association.
 
 ## Deploy without installing Python on other computers
 

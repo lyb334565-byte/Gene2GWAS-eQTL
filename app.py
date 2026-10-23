@@ -10,7 +10,7 @@ import streamlit as st
 from core import (
     APIError, EQTL_COLUMNS, GENOME_BUILD, GWAS_COLUMNS, OVERLAP_COLUMNS,
     fetch_ensembl, fetch_gtex_eqtl, fetch_gtex_gene, fetch_gwas,
-    gene_info_table, match_rsids, normalize_eqtl, normalize_gwas,
+    gene_info_table, match_positions, normalize_eqtl, normalize_gwas,
     utc_now, workbook_bytes,
 )
 
@@ -107,7 +107,7 @@ def run_query(query: str, dataset: str, tissues: tuple[str, ...],
     else:
         result["status"]["GTEx_eQTL"] = "error"
 
-    result["overlap"] = match_rsids(result["gwas"], result["eqtl"])
+    result["overlap"] = match_positions(result["gwas"], result["eqtl"])
     return result
 
 
@@ -130,7 +130,7 @@ def dataframe_view(df: pd.DataFrame, height: int = 420) -> None:
 
 st.title("🧬 Gene2GWAS-eQTL")
 st.caption("输入人类基因 → GWAS Catalog v2 关联证据 + GTEx v2 显著 eQTL → Excel 导出")
-st.info("**重要说明：** GWAS 的基因映射不等于因果基因；相同 rsID 同时出现在 GWAS/eQTL 中，也不等于已证实共定位或相同效应等位基因。", icon="🔬")
+st.info("**重要说明：** GWAS 的基因映射不等于因果基因；相同染色体位置同时出现在 GWAS/eQTL 中，也不等于已证实共定位或相同效应等位基因。", icon="🔬")
 
 with st.sidebar:
     st.header("查询设置")
@@ -176,8 +176,8 @@ if "result" not in st.session_state:
     st.markdown("### 开始使用")
     st.write("左侧保留默认基因 **BACH1**，点击 **开始查询** 即可。也可以输入 `NFE2L2`、`NOS3`、`KLF2` 等人类基因。")
     a, b, c = st.columns(3)
-    a.markdown("**GWAS**  \n疾病/性状、rsID、P值、效应")
-    b.markdown("**GTEx eQTL**  \n组织、rsID、NES、P值")
+    a.markdown("**GWAS**  \n疾病/性状、rsID/坐标、P值、效应")
+    b.markdown("**GTEx eQTL**  \n组织、rsID/坐标、NES、P值")
     c.markdown("**Excel**  \n完整查询记录及数据源说明")
     st.stop()
 
@@ -201,7 +201,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("GWAS 已获取记录", f"{len(r['gwas']):,}")
 m2.metric("GTEx 已获取 eQTL", f"{len(r['eqtl']):,}")
 m3.metric("eQTL 涉及组织", r["eqtl"]["Tissue"].nunique() if not r["eqtl"].empty else 0)
-m4.metric("相同 rsID 匹配行", f"{len(r['overlap']):,}")
+m4.metric("相同基因组位置匹配行", f"{len(r['overlap']):,}")
 
 st.markdown("#### 筛选已获取的结果")
 c1, c2 = st.columns(2)
@@ -217,7 +217,7 @@ if selected_tissues:
     edf = edf[edf["Tissue"].isin(selected_tissues)].copy()
 ov = match_rsids(gdf, edf)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["GWAS 结果", "GTEx eQTL", "rsID 重叠", "基因信息", "下载与说明"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["GWAS 结果", "GTEx eQTL", "位置重叠", "基因信息", "下载与说明"])
 
 with tab1:
     st.caption(f"显示 {len(gdf):,} / {len(r['gwas']):,} 条已获取 GWAS 关联；默认按来源接口的 P 值升序请求。")
@@ -251,10 +251,10 @@ with tab2:
             st.plotly_chart(fig, use_container_width=True)
 
 with tab3:
-    st.info("这里仅按 **完全相同的 rsID** 匹配两个结果表，**没有做 LD、等位基因协调、fine-mapping 或 coloc 共定位**。某些 GWAS 变异缺少 rsID 时无法自动匹配。")
+    st.info("这里按 **相同染色体 + 碱基位置（Chromosome + Position）** 进行精确匹配，假设 GWAS 与 GTEx 坐标均为 **GRCh38/hg38**。不要求两侧都有 rsID；若位置相同但等位基因不同，仍可能匹配，因此这不是等位基因协调、LD 分析或 coloc 共定位。")
     dataframe_view(ov)
     if ov.empty and (r["gwas_truncated"] or r["eqtl_truncated"]):
-        st.warning("当前两组数据有截断，未发现 rsID 重叠不能解释为全量数据无重叠。")
+        st.warning("当前两组数据有截断，未发现位置重叠不能解释为全量数据无重叠。")
 
 with tab4:
     dataframe_view(r["gene_info"], height=330)
@@ -266,7 +266,7 @@ with tab5:
         "Gene_Info": r["gene_info"],
         "GWAS_Results": gdf,
         "GTEx_eQTL": edf,
-        "rsID_Overlap": ov,
+        "Position_Overlap": ov,
         "Source_Status": pd.DataFrame([
             {"Source": k, "Status": v, "Error": r["errors"].get(k, "")}
             for k, v in r["status"].items()
@@ -287,7 +287,7 @@ with tab5:
         "GTEx_truncated": r["eqtl_truncated"],
         "GWAS_P_filter_for_export": gwas_limit,
         "GTEx_tissue_filter_for_export": ", ".join(selected_tissues) or "no additional filter",
-        "Scientific_caveat": "Gene mapping and rsID overlap do not establish causality or colocalization.",
+        "Scientific_caveat": "Exact chromosome-position overlap assumes matching GRCh38/hg38 coordinates; it does not establish allele harmonization, causality or colocalization.",
     }
     excel = workbook_bytes(tables, meta)
     st.download_button("⬇️ 下载 Excel 工作簿", data=excel,
@@ -300,6 +300,6 @@ with tab5:
 - GWAS 按基因映射查询可能包括附近位点，不能直接推断作用基因。
 - GTEx `/singleTissueEqtl` 返回预计算的显著 eQTL，并不包含全部未显著检测结果。
 - 超过页数上限时，工作簿只包括已获取并通过当前筛选的记录。保留页数和截断标记便于复现。
-- 重叠表只是同 rsID 匹配，不提供因果结论。若需要正式共定位，应另取匹配的全区域 summary statistics。
+- 位置重叠表仅按染色体 + 碱基位置匹配，假设坐标均为 GRCh38/hg38；同位置不保证等位基因一致，也不提供因果结论。正式共定位应另取匹配的全区域 summary statistics。
 """)
     st.markdown("[GWAS Catalog 接口文档](https://www.ebi.ac.uk/gwas/docs/programmatic-access/rest-api/) · [GTEx v2 接口文档](https://gtexportal.org/api/v2/docs) · [Ensembl REST 文档](https://rest.ensembl.org/documentation/info/symbol_lookup)")

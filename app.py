@@ -215,7 +215,7 @@ gdf = filter_p(r["gwas"], threshold)
 edf = r["eqtl"]
 if selected_tissues:
     edf = edf[edf["Tissue"].isin(selected_tissues)].copy()
-ov = match_rsids(gdf, edf)
+ov = match_positions(gdf, edf)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["GWAS 结果", "GTEx eQTL", "位置重叠", "基因信息", "下载与说明"])
 

@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 GWAS_API = "https://www.ebi.ac.uk/gwas/rest/api/v2/associations"
+GWAS_VARIANT_API = "https://www.ebi.ac.uk/gwas/rest/api/v2/single-nucleotide-polymorphism"
 GTEX_API = "https://gtexportal.org/api/v2"
 ENSEMBL_API = "https://rest.ensembl.org"
 USER_AGENT = "Gene2GWAS-eQTL/1.0 (academic research tool)"
@@ -28,7 +29,7 @@ GENCODE_BY_DATASET = {"gtex_v10": "v39", "gtex_v8": "v26"}
 GENOME_BUILD = "GRCh38/hg38"
 
 GWAS_COLUMNS = [
-    "Gene", "Trait", "Reported_trait", "rsID", "Chromosome", "Position",
+    "Gene", "Trait", "Reported_trait", "rsID", "rsID_Source", "Chromosome", "Position",
     "P_value", "Effect_type", "Effect_size", "Risk_allele", "Mapped_genes",
     "Study_accession", "PMID", "Association_ID", "Source_URL",
 ]
@@ -90,10 +91,16 @@ def _collection(payload: Any, key: str) -> list[dict]:
         return [r for r in payload if isinstance(r, dict)]
     if not isinstance(payload, dict):
         raise APIError("接口响应结构无法识别：不是 JSON 对象/数组")
+    variant_keys = [
+        "singleNucleotidePolymorphisms", "singleNucleotidePolymorphism",
+        "single_nucleotide_polymorphisms", "single_nucleotide_polymorphism",
+        "variants",
+    ] if key in {"variants", "singleNucleotidePolymorphisms", "singleNucleotidePolymorphism"} else []
+    candidate_keys = list(dict.fromkeys([key, *variant_keys, "data", "results", "items", "content"]))
     for parent in [payload.get("_embedded"), payload]:
         if not isinstance(parent, dict):
             continue
-        for k in [key, "data", "results", "items", "content"]:
+        for k in candidate_keys:
             if k in parent and isinstance(parent[k], list):
                 return [r for r in parent[k] if isinstance(r, dict)]
     page = payload.get("page", payload.get("paging_info", {}))
@@ -293,21 +300,76 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _parse_location_object(obj: Any, depth: int = 0) -> tuple[str, int | None]:
+    """Extract a chromosome/position pair from GWAS Catalog v2 or nested variant data."""
+    if depth > 5:
+        return "", None
+    if isinstance(obj, str):
+        match = re.search(r"(?:chr)?([0-9XYM]+)[:_-](\d+)", obj, re.I)
+        if match:
+            return match.group(1).removeprefix("chr"), int(match.group(2))
+        return "", None
+    if isinstance(obj, list):
+        for item in obj:
+            chrom, pos = _parse_location_object(item, depth + 1)
+            if chrom and pos is not None:
+                return chrom, pos
+        return "", None
+    if not isinstance(obj, dict):
+        return "", None
+
+    chrom = _get(obj, "chromosomeName", "chromosome_name", "chromosome", "chr", "chr_name")
+    pos = _get(obj, "chromosomePosition", "chromosome_position", "position", "pos", "bp_location", "bpLocation")
+    if chrom is not None and pos is not None and str(pos).isdigit():
+        chrom_text = str(chrom).strip().removeprefix("chr")
+        return chrom_text, int(pos)
+
+    for key in ("locations", "location", "genomicLocations", "genomic_locations", "loci", "locus",
+                "variant", "variants", "singleNucleotidePolymorphism", "single_nucleotide_polymorphism"):
+        if key in obj:
+            found_chrom, found_pos = _parse_location_object(obj[key], depth + 1)
+            if found_chrom and found_pos is not None:
+                return found_chrom, found_pos
+    return "", None
+
+
 def _location(row: dict) -> tuple[str, int | None]:
-    loc = _get(row, "locations", "location", "genomicLocations")
-    if isinstance(loc, list) and loc:
-        loc = loc[0]
-    if isinstance(loc, dict):
-        ch = _get(loc, "chromosomeName", "chromosome", "chr")
-        pos = _get(loc, "chromosomePosition", "position", "pos")
-        return str(ch or "").removeprefix("chr"), int(pos) if str(pos or "").isdigit() else None
-    if isinstance(loc, str):
-        m = re.search(r"(?:chr)?([0-9XYM]+):(\d+)", loc, re.I)
-        if m:
-            return m.group(1), int(m.group(2))
-    chrom = _get(row, "chromosome", "chr")
-    pos = _get(row, "position", "pos")
-    return str(chrom or "").removeprefix("chr"), int(pos) if str(pos or "").isdigit() else None
+    """Read coordinates from direct fields or nested v2 locus/variant structures."""
+    return _parse_location_object(row)
+
+
+def _extract_rsids(value: Any) -> list[str]:
+    """Extract explicit dbSNP rsIDs from a value while preserving their first-seen order."""
+    found: list[str] = []
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for child in item.values():
+                walk(child)
+        elif isinstance(item, (list, tuple, set)):
+            for child in item:
+                walk(child)
+        elif isinstance(item, str):
+            found.extend(re.findall(r"\brs\d+\b", item, flags=re.I))
+
+    walk(value)
+    return list(dict.fromkeys(x.lower() for x in found))
+
+
+def _record_rsids(row: dict) -> list[str]:
+    """Inspect variant-specific fields in a GWAS association/variant record."""
+    keys = (
+        "rs_id", "rs_ids", "rsId", "rsID", "rsid", "snps", "snpIds", "snp_id", "snpId",
+        "variant_id", "variantId", "variant", "variants", "loci", "locus",
+        "singleNucleotidePolymorphism", "single_nucleotide_polymorphism",
+        "risk_allele", "riskAllele", "strongest_allele", "strongestAllele", "id",
+        "strongest_risk_alleles", "strongestRiskAlleles",
+    )
+    found: list[str] = []
+    for key in keys:
+        if key in row and row[key] is not None:
+            found.extend(_extract_rsids(row[key]))
+    return list(dict.fromkeys(found))
 
 
 def normalize_gwas(rows: list[dict], queried_gene: str) -> pd.DataFrame:
@@ -327,13 +389,15 @@ def normalize_gwas(rows: list[dict], queried_gene: str) -> pd.DataFrame:
                 pval = mant * 10 ** exponent
         beta = _get(row, "beta_num", "betaNum", "beta")
         odds = _get(row, "or_per_copy_num", "orPerCopyNum", "odds_ratio", "or_value")
-        rsid = _text(_get(row, "rs_id", "rs_ids", "rsId", "rsID", "snps", "snpIds", "variant_id"))
+        rsids = _record_rsids(row)
+        rsid = "; ".join(rsids)
+        rsid_source = "GWAS Catalog association record" if rsid else "Unresolved"
         url_id = _get(row, "association_id", "associationId", "id")
         result.append({
             "Gene": queried_gene,
             "Trait": _text(_get(row, "efo_traits", "efoTraits", "efo_trait", "efoTrait", "trait", "mapped_traits")),
             "Reported_trait": _text(_get(row, "disease_trait", "diseaseTrait", "reported_trait")),
-            "rsID": rsid,
+            "rsID": rsid, "rsID_Source": rsid_source,
             "Chromosome": chrom, "Position": pos,
             "P_value": pval,
             "Effect_type": "Beta" if beta is not None else ("OR" if odds is not None else ""),
@@ -371,6 +435,94 @@ def normalize_eqtl(rows: list[dict], queried_gene: str) -> pd.DataFrame:
 
 def _rs_ids(value: Any) -> set[str]:
     return {x.lower() for x in re.findall(r"\brs\d+\b", str(value), flags=re.I)}
+
+
+def fetch_gwas_variants(gene_symbol: str, extended: bool = False, max_pages: int = 3,
+                         page_size: int = 100, session: requests.Session | None = None) -> Pages:
+    """Fetch GWAS Catalog variant records as a fallback for associations without an rsID."""
+    own_session = session is None
+    session = session or make_session()
+    rows: list[dict] = []
+    total: int | None = None
+    truncated = False
+    pages_fetched = 0
+    try:
+        for page in range(max_pages):
+            params = {
+                "mapped_gene": gene_symbol,
+                "extended_geneset": str(extended).lower(),
+                "page": page, "size": page_size,
+            }
+            payload = get_json(session, GWAS_VARIANT_API, params)
+            page_rows = _collection(payload, "variants")
+            rows.extend(page_rows)
+            pages_fetched += 1
+            if total is None:
+                total = _total(payload, is_gtex=False)
+            has_next = _has_next(payload, page, page_size, len(page_rows), is_gtex=False)
+            if not has_next:
+                break
+            if page + 1 == max_pages:
+                truncated = True
+            time.sleep(0.12)
+        return Pages(rows, total, truncated, pages_fetched)
+    finally:
+        if own_session:
+            session.close()
+
+
+def _coordinate_key(chromosome: Any, position: Any) -> tuple[str, int] | None:
+    chrom = str(chromosome or "").strip().lower().removeprefix("chr")
+    if not chrom or position is None:
+        return None
+    try:
+        pos = int(position)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pos <= 0:
+        return None
+    if chrom in {"m", "mt"}:
+        chrom = "mt"
+    return chrom, pos
+
+
+def enrich_gwas_rsids(gwas: pd.DataFrame, variant_rows: list[dict]) -> pd.DataFrame:
+    """Fill missing GWAS rsIDs only when GRCh38 coordinate mapping is unique.
+
+    GWAS Catalog and GTEx use GRCh38 coordinates. Ambiguous coordinate-to-rsID
+    mappings are deliberately left unresolved rather than guessing.
+    """
+    if gwas.empty or not variant_rows:
+        return gwas.copy()
+    coordinate_ids: dict[tuple[str, int], set[str]] = {}
+    for row in variant_rows:
+        chrom, pos = _location(row)
+        key = _coordinate_key(chrom, pos)
+        if key is None:
+            continue
+        rsids = _record_rsids(row)
+        if not rsids:
+            continue
+        coordinate_ids.setdefault(key, set()).update(rsids)
+
+    out = gwas.copy()
+    if "rsID_Source" not in out.columns:
+        out["rsID_Source"] = "Unresolved"
+    for idx, row in out.iterrows():
+        if _rs_ids(row.get("rsID", "")):
+            if not str(row.get("rsID_Source", "")).strip() or row.get("rsID_Source") == "Unresolved":
+                out.at[idx, "rsID_Source"] = "GWAS Catalog association record"
+            continue
+        key = _coordinate_key(row.get("Chromosome"), row.get("Position"))
+        if key is None:
+            continue
+        candidates = coordinate_ids.get(key, set())
+        if len(candidates) == 1:
+            out.at[idx, "rsID"] = next(iter(candidates))
+            out.at[idx, "rsID_Source"] = "GWAS Catalog variant coordinate match (GRCh38)"
+        elif len(candidates) > 1:
+            out.at[idx, "rsID_Source"] = "Ambiguous coordinate mapping; left unresolved"
+    return out
 
 
 def match_rsids(gwas: pd.DataFrame, eqtl: pd.DataFrame, max_matches: int = 20000) -> pd.DataFrame:

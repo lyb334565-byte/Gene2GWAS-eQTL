@@ -9,8 +9,8 @@ import streamlit as st
 
 from core import (
     APIError, EQTL_COLUMNS, GENOME_BUILD, GWAS_COLUMNS, OVERLAP_COLUMNS,
-    fetch_ensembl, fetch_gtex_eqtl, fetch_gtex_gene, fetch_gwas,
-    gene_info_table, match_rsids, normalize_eqtl, normalize_gwas,
+    enrich_gwas_rsids, fetch_ensembl, fetch_gtex_eqtl, fetch_gtex_gene,
+    fetch_gwas, fetch_gwas_variants, gene_info_table, match_rsids, normalize_eqtl, normalize_gwas,
     utc_now, workbook_bytes,
 )
 
@@ -78,11 +78,32 @@ def run_query(query: str, dataset: str, tissues: tuple[str, ...],
     result["gene_info"] = gene_info_table(query, gtex_gene, ensembl)
     try:
         g = fetch_gwas(gwas_gene, extended=extended, max_pages=max_gwas_pages)
-        result["gwas"] = normalize_gwas(g.rows, gwas_gene)
+        gwas_df = normalize_gwas(g.rows, gwas_gene)
         result["gwas_pages"] = g.pages_fetched
         result["gwas_total"] = g.total
         result["gwas_truncated"] = g.truncated
         result["status"]["GWAS"] = "ok" if len(g.rows) else "empty"
+
+        # Some v2 association payloads omit rsID at the association level. Query
+        # the Catalog's SNP resource and recover IDs only for unique GRCh38
+        # coordinate matches; ambiguous mappings are not guessed.
+        missing_rsid = ~gwas_df["rsID"].fillna("").astype(str).str.contains(r"\brs\d+\b", case=False, regex=True)
+        coord_available = (gwas_df["Chromosome"].fillna("").astype(str).str.strip().ne("")
+                           & pd.to_numeric(gwas_df["Position"], errors="coerce").notna())
+        if (missing_rsid & coord_available).any():
+            try:
+                variants = fetch_gwas_variants(
+                    gwas_gene, extended=extended, max_pages=max_gwas_pages,
+                )
+                before = int(gwas_df["rsID"].fillna("").astype(str).str.contains(r"\brs\d+\b", case=False, regex=True).sum())
+                gwas_df = enrich_gwas_rsids(gwas_df, variants.rows)
+                after = int(gwas_df["rsID"].fillna("").astype(str).str.contains(r"\brs\d+\b", case=False, regex=True).sum())
+                result["status"]["GWAS_rsID_lookup"] = "ok" if after > before else "no_additional_matches"
+                result["warnings"].append(f"rsID补充查询：坐标唯一匹配新增 {after - before} 条；未能安全映射的记录保留为空。")
+            except APIError as exc:
+                result["status"]["GWAS_rsID_lookup"] = "error"
+                result["warnings"].append(f"GWAS rsID补充查询失败，保留原始记录：{exc}")
+        result["gwas"] = gwas_df
     except APIError as exc:
         result["errors"]["GWAS"] = str(exc)
         result["status"]["GWAS"] = "error"
@@ -186,6 +207,8 @@ st.markdown(f"### 查询结果：`{r['query']}`")
 st.caption(f"查询时间：{r['queried_at']} · {r['dataset']} · 基因组坐标：{GENOME_BUILD}")
 for source, message in r["errors"].items():
     st.error(f"{source} 查询失败（**不是阴性结果**）：{message}")
+for message in r.get("warnings", []):
+    st.warning(message)
 if r["status"].get("GTEx_gene") == "not_found":
     st.warning("GTEx 所选数据版本中未能精确匹配该基因的版本化 GENCODE ID；eQTL 查询未执行。GWAS 仍独立查询。")
 if r["status"].get("GWAS") == "empty":
@@ -220,7 +243,8 @@ ov = match_rsids(gdf, edf)
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["GWAS 结果", "GTEx eQTL", "rsID 重叠", "基因信息", "下载与说明"])
 
 with tab1:
-    st.caption(f"显示 {len(gdf):,} / {len(r['gwas']):,} 条已获取 GWAS 关联；默认按来源接口的 P 值升序请求。")
+    rsid_count = int(gdf["rsID"].fillna("").astype(str).str.contains(r"\brs\d+\b", case=False, regex=True).sum()) if "rsID" in gdf.columns else 0
+    st.caption(f"显示 {len(gdf):,} / {len(r['gwas']):,} 条已获取 GWAS 关联；其中 {rsid_count:,} 条包含可识别 rsID。")
     dataframe_view(gdf)
     plotdf = gdf.copy()
     if not plotdf.empty:
@@ -251,7 +275,7 @@ with tab2:
             st.plotly_chart(fig, use_container_width=True)
 
 with tab3:
-    st.info("这里仅按 **完全相同的 rsID** 匹配两个结果表，**没有做 LD、等位基因协调、fine-mapping 或 coloc 共定位**。某些 GWAS 变异缺少 rsID 时无法自动匹配。")
+    st.info("这里仅按 **完全相同的 rsID** 匹配两个结果表。程序会先读取关联记录中的 rsID；缺失时尝试通过 GWAS Catalog 变异记录按 GRCh38 染色体坐标补充，只有唯一匹配才会填入。仍无法唯一映射的记录会保留为空。该分析未进行 LD、等位基因协调、fine-mapping 或 coloc 共定位。")
     dataframe_view(ov)
     if ov.empty and (r["gwas_truncated"] or r["eqtl_truncated"]):
         st.warning("当前两组数据有截断，未发现 rsID 重叠不能解释为全量数据无重叠。")

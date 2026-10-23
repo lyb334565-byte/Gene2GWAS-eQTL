@@ -37,8 +37,9 @@ EQTL_COLUMNS = [
     "Position", "P_value", "NES", "Dataset", "Source_URL",
 ]
 OVERLAP_COLUMNS = [
-    "Gene", "rsID", "GWAS_trait", "GWAS_P", "GTEx_tissue", "eQTL_P", "eQTL_NES",
-    "GWAS_study", "GTEx_variant_ID", "Evidence_note",
+    "Gene", "Chromosome", "Position", "GWAS_trait", "GWAS_P", "GTEx_tissue",
+    "eQTL_P", "eQTL_NES", "GWAS_rsID", "GTEx_rsID", "GWAS_study",
+    "GTEx_variant_ID", "Evidence_note",
 ]
 
 
@@ -373,38 +374,103 @@ def _rs_ids(value: Any) -> set[str]:
     return {x.lower() for x in re.findall(r"\brs\d+\b", str(value), flags=re.I)}
 
 
-def match_rsids(gwas: pd.DataFrame, eqtl: pd.DataFrame, max_matches: int = 20000) -> pd.DataFrame:
-    """Exact rsID overlap only. This is NOT formal colocalization or allele harmonization."""
+def _chromosome_key(value: Any) -> str:
+    """Normalize chromosome labels (e.g. chr1/1, chrX/X) for coordinate matching."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    chrom = re.sub(r"^chr", "", str(value).strip(), flags=re.I).upper()
+    if not chrom:
+        return ""
+    if chrom in {"M", "MT", "MITO", "MITOCHONDRIAL"}:
+        return "MT"
+    if chrom in {"X", "Y", "XY"}:
+        return chrom
+    if chrom.isdigit():
+        return str(int(chrom))
+    return chrom
+
+
+def _position_key(value: Any) -> int | None:
+    """Normalize integer genomic coordinates; reject missing/non-integer positions."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        number = float(text)
+        if not (number > 0):
+            return None
+        position = int(number)
+        if position != number:
+            return None
+        return position
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _coordinate_key(chromosome: Any, position: Any) -> tuple[str, int] | None:
+    chrom = _chromosome_key(chromosome)
+    pos = _position_key(position)
+    return (chrom, pos) if chrom and pos is not None else None
+
+
+def match_positions(gwas: pd.DataFrame, eqtl: pd.DataFrame, max_matches: int = 20000) -> pd.DataFrame:
+    """Match exact chromosome + position pairs. This is not colocalization or allele harmonization."""
     if gwas.empty or eqtl.empty:
         return pd.DataFrame(columns=OVERLAP_COLUMNS)
-    index: dict[str, list[dict]] = {}
-    for r in eqtl.to_dict("records"):
-        for snp in _rs_ids(r.get("rsID")):
-            index.setdefault(snp, []).append(r)
+
+    index: dict[tuple[str, int], list[dict]] = {}
+    for row in eqtl.to_dict("records"):
+        coordinate = _coordinate_key(row.get("Chromosome"), row.get("Position"))
+        if coordinate is not None:
+            index.setdefault(coordinate, []).append(row)
+
     matches = []
     seen = set()
     for gr in gwas.to_dict("records"):
-        for snp in _rs_ids(gr.get("rsID")):
-            for er in index.get(snp, []):
-                key = (gr.get("Association_ID"), gr.get("Study_accession"),
-                       gr.get("Trait"), gr.get("P_value"), snp,
-                       er.get("Tissue"), er.get("Variant_ID"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                matches.append({
-                    "Gene": gr.get("Gene"), "rsID": snp,
-                    "GWAS_trait": gr.get("Trait") or gr.get("Reported_trait"),
-                    "GWAS_P": gr.get("P_value"), "GTEx_tissue": er.get("Tissue"),
-                    "eQTL_P": er.get("P_value"), "eQTL_NES": er.get("NES"),
-                    "GWAS_study": gr.get("Study_accession"),
-                    "GTEx_variant_ID": er.get("Variant_ID"),
-                    "Evidence_note": "Exact rsID overlap only; NOT colocalization",
-                })
-                if len(matches) >= max_matches:
-                    return pd.DataFrame(matches, columns=OVERLAP_COLUMNS)
+        coordinate = _coordinate_key(gr.get("Chromosome"), gr.get("Position"))
+        if coordinate is None:
+            continue
+        chromosome, position = coordinate
+        for er in index.get(coordinate, []):
+            key = (
+                gr.get("Association_ID"), gr.get("Study_accession"),
+                gr.get("Trait"), gr.get("Reported_trait"), gr.get("P_value"),
+                chromosome, position, er.get("Tissue"), er.get("Variant_ID"),
+                er.get("P_value"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append({
+                "Gene": gr.get("Gene") or er.get("Gene"),
+                "Chromosome": chromosome,
+                "Position": position,
+                "GWAS_trait": gr.get("Trait") or gr.get("Reported_trait"),
+                "GWAS_P": gr.get("P_value"),
+                "GTEx_tissue": er.get("Tissue"),
+                "eQTL_P": er.get("P_value"),
+                "eQTL_NES": er.get("NES"),
+                "GWAS_rsID": gr.get("rsID"),
+                "GTEx_rsID": er.get("rsID"),
+                "GWAS_study": gr.get("Study_accession"),
+                "GTEx_variant_ID": er.get("Variant_ID"),
+                "Evidence_note": "Exact chromosome-position overlap; assumes GRCh38/hg38; NOT colocalization or allele harmonization",
+            })
+            if len(matches) >= max_matches:
+                return pd.DataFrame(matches, columns=OVERLAP_COLUMNS)
     return pd.DataFrame(matches, columns=OVERLAP_COLUMNS)
-
 
 def gene_info_table(query: str, gtex_gene: dict | None, ensembl: dict | None) -> pd.DataFrame:
     result = [{"Field": "Query", "Value": query}]
